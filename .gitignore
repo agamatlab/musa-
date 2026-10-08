@@ -1,0 +1,25 @@
+# Conda environment
+env/
+
+# Model weights (download from Hugging Face: EvolutionaryScale/esm3-sm-open-v1)
+models/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# Generated outputs
+outputs/
+cuda_reference.pt
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Editor / tool state
+.vscode/
+.idea/
+.claude/
+*.swp
+.DS_Store
