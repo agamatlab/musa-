@@ -15,7 +15,7 @@ except (ImportError, RuntimeError):
 # Toggle: on MUSA, use the tiled (O(L) memory) FP32 attention instead of the
 # O(L^2) math-fallback SDPA. Flip to False to force the original SDPA path
 # (used by compare scripts to measure tiled-vs-original on the same weights).
-USE_TILED_ATTENTION = True
+USE_TILED_ATTENTION = False  # opt-in; no measured speed gain, default keeps stock SDPA
 
 
 class MultiHeadAttention(nn.Module):
@@ -85,7 +85,8 @@ class MultiHeadAttention(nn.Module):
             context_BHLD = torch.einsum("bhls,bhsd->bhld", attn_weights, value_BHLD)
         else:
             attn_weights = None
-            if query_BHLD.device.type == "musa" and USE_TILED_ATTENTION:
+            if (query_BHLD.device.type == "musa" and USE_TILED_ATTENTION
+                    and query_BHLD.dtype == torch.float32):
                 # MUSA has no memory-efficient FP32 SDPA kernel: F.sdpa falls back
                 # to math and materializes the full LxL scores -> O(L^2) memory.
                 # Use a tiled (flash-style) FP32 attention instead -> O(L) memory,

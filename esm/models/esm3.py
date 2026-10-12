@@ -46,6 +46,12 @@ from esm.utils.sampling import (
 )
 from esm.utils.structure.affine3d import build_affine3d_from_coordinates
 
+# When no structure coordinates are given, every frame is masked and block 0's
+# geometric attention returns exactly zero (mask_and_zero_frameless=True and a
+# bias-free out_proj). Skipping it keeps outputs identical, avoids the
+# [B, 256, L, L, 3] temporary (OOM at L=2048) and needs no device sync.
+SKIP_GEOM_WITHOUT_COORDS = True
+
 
 def _musa_available() -> bool:
     """Return whether this PyTorch build exposes a usable MUSA backend."""
@@ -382,6 +388,7 @@ class ESM3(nn.Module, ESM3InferenceClient):
                 (1, L, 8), C.INTERPRO_PAD_TOKEN, dtype=torch.long, device=device
             )
 
+        has_coords = structure_coords is not None
         if structure_coords is None:
             structure_coords = torch.full(
                 (1, L, 3, 3), float("nan"), dtype=torch.float, device=device
@@ -390,7 +397,10 @@ class ESM3(nn.Module, ESM3InferenceClient):
         structure_coords = structure_coords[
             ..., :3, :
         ]  # In case we pass in an atom14 or atom37 repr
-        affine, affine_mask = build_affine3d_from_coordinates(structure_coords)
+        if has_coords or not SKIP_GEOM_WITHOUT_COORDS:
+            affine, affine_mask = build_affine3d_from_coordinates(structure_coords)
+        else:
+            affine, affine_mask = None, None  # geometric attention skipped (see above)
 
         structure_tokens = defaults(structure_tokens, C.STRUCTURE_MASK_TOKEN)
         assert structure_tokens is not None

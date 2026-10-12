@@ -167,8 +167,15 @@ class UnifiedTransformerBlock(nn.Module):
             x = _add_residual(x, r1, self.scaling_factor, x.device.type)
 
         if self.use_geom_attn:
-            r2 = self.geom_attn(x, frames, frames_mask, sequence_id, chain_id)
-            x = _add_residual(x, r2, self.scaling_factor, x.device.type)
+            if frames is None:
+                # Caller had no coordinates (ESM3.forward, SKIP_GEOM_WITHOUT_COORDS):
+                # skipping is only exact when the block would output zeros.
+                if not (self.geom_attn.mask_and_zero_frameless
+                        and self.geom_attn.out_proj.bias is None):
+                    raise ValueError("geometric attention needs frames for this block")
+            else:
+                r2 = self.geom_attn(x, frames, frames_mask, sequence_id, chain_id)
+                x = _add_residual(x, r2, self.scaling_factor, x.device.type)
 
         r3 = self.ffn(x)
         x = _add_residual(x, r3, self.scaling_factor, x.device.type)
