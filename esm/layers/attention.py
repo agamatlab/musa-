@@ -12,6 +12,11 @@ try:
 except (ImportError, RuntimeError):
     flash_attn_varlen_qkvpacked_func = None  # ty:ignore[invalid-assignment]
 
+# Toggle: on MUSA, use the tiled (O(L) memory) FP32 attention instead of the
+# O(L^2) math-fallback SDPA. Flip to False to force the original SDPA path
+# (used by compare scripts to measure tiled-vs-original on the same weights).
+USE_TILED_ATTENTION = True
+
 
 class MultiHeadAttention(nn.Module):
     def __init__(
@@ -80,7 +85,16 @@ class MultiHeadAttention(nn.Module):
             context_BHLD = torch.einsum("bhls,bhsd->bhld", attn_weights, value_BHLD)
         else:
             attn_weights = None
-            if mask_BHLL is None:
+            if query_BHLD.device.type == "musa" and USE_TILED_ATTENTION:
+                # MUSA has no memory-efficient FP32 SDPA kernel: F.sdpa falls back
+                # to math and materializes the full LxL scores -> O(L^2) memory.
+                # Use a tiled (flash-style) FP32 attention instead -> O(L) memory,
+                # numerically identical (~1e-6). See esm/layers/tiled_attention.py.
+                from esm.layers.tiled_attention import tiled_attention
+                context_BHLD = tiled_attention(
+                    query_BHLD, key_BHLD, value_BHLD, mask_BHLL, block_k=512
+                )
+            elif mask_BHLL is None:
                 # Shortcut, if we don't use attention biases then torch
                 # will autoselect flashattention as the implementation
                 context_BHLD = F.scaled_dot_product_attention(
