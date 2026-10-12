@@ -31,6 +31,12 @@ except ImportError:
     apply_triton_rotary = None  # ty:ignore[invalid-assignment]
 
 
+# Opt-in: same arithmetic as apply_rotary_emb_torch (x*cos + rotate_half(x)*sin), but with
+# full-width cos / sign-folded sin tables cached once and the half swap done by one flip,
+# instead of 2 repeats + neg + 2 cats per call. Bit-identical: x2*(-s) == (-x2)*s exactly.
+FAST_ROTARY = True
+
+
 def rotate_half(x, interleaved=False):
     if not interleaved:
         x1, x2 = x.chunk(2, dim=-1)
@@ -207,6 +213,21 @@ class RotaryEmbedding(torch.nn.Module):
         )
         assert self._cos_cached is not None
         assert self._sin_cached is not None
+        if (FAST_ROTARY and self.scale is None and not self.interleaved
+                and self._cos_cached.shape[-1] * 2 == q.shape[-1]):
+            if getattr(self, "_fast_src", None) is not self._cos_cached:
+                self._fast_src = self._cos_cached
+                self._fast_cos = torch.cat([self._cos_cached, self._cos_cached], -1)[:, None, :]
+                self._fast_sin = torch.cat([-self._sin_cached, self._sin_cached], -1)[:, None, :]
+            L = q.shape[1]
+            cos = self._fast_cos[seqlen_offset:seqlen_offset + L]
+            sin = self._fast_sin[seqlen_offset:seqlen_offset + L]
+
+            def rot(x):
+                swapped = x.unflatten(-1, (2, x.shape[-1] // 2)).flip(-2).flatten(-2)
+                return x * cos + swapped * sin
+
+            return rot(q), rot(k)
         if self.scale is None:
             return (
                 apply_rotary_emb_torch(

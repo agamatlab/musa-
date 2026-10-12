@@ -1,4 +1,5 @@
 import functools
+import os
 
 import einops
 import torch
@@ -15,6 +16,12 @@ except (ImportError, RuntimeError):
 # Toggle: on MUSA, use the tiled (O(L) memory) FP32 attention instead of the
 # O(L^2) math-fallback SDPA. Flip to False to force the original SDPA path
 # (used by compare scripts to measure tiled-vs-original on the same weights).
+# Opt-in: under BF16 autocast, run the Q/K LayerNorms natively on the BF16 tensors
+# (stats are accumulated in FP32 inside the kernel) instead of autocast's
+# BF16->FP32 cast, FP32 LayerNorm, FP32->BF16 cast. Not guaranteed bit-identical.
+# Enable with QK_LN_NATIVE_BF16 = True or env ESM_QK_LN_NATIVE_BF16=1 (BF16 only; ~-1-2 ms,
+# -192 kernels; accuracy validated by tests/accuracy_suite.py, slightly different bits).
+QK_LN_NATIVE_BF16 = os.environ.get("ESM_QK_LN_NATIVE_BF16", "0") == "1"
 USE_TILED_ATTENTION = False  # opt-in; no measured speed gain, default keeps stock SDPA
 
 
@@ -55,10 +62,27 @@ class MultiHeadAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         qkv_BLD3 = self.layernorm_qkv(x)
         query_BLD, key_BLD, value_BLD = torch.chunk(qkv_BLD3, 3, dim=-1)
-        query_BLD, key_BLD = (
-            self.q_ln(query_BLD).to(query_BLD.dtype),
-            self.k_ln(key_BLD).to(query_BLD.dtype),
-        )
+        if (QK_LN_NATIVE_BF16 and query_BLD.dtype == torch.bfloat16
+                and isinstance(self.q_ln, nn.LayerNorm)):
+            # torch_musa's LayerNorm needs weight dtype == input dtype: use cached BF16
+            # copies of the (1536-element) Q/K LayerNorm weights.
+            if getattr(self, "_qk_ln_src", None) is not self.q_ln.weight:
+                self._qk_ln_src = self.q_ln.weight
+                self._q_ln_w = self.q_ln.weight.detach().to(torch.bfloat16)
+                self._k_ln_w = self.k_ln.weight.detach().to(torch.bfloat16)
+                bq, bk = self.q_ln.bias, self.k_ln.bias
+                self._q_ln_b = None if bq is None else bq.detach().to(torch.bfloat16)
+                self._k_ln_b = None if bk is None else bk.detach().to(torch.bfloat16)
+            with torch.autocast(device_type=query_BLD.device.type, enabled=False):
+                query_BLD = F.layer_norm(query_BLD, self.q_ln.normalized_shape,
+                                         self._q_ln_w, self._q_ln_b, self.q_ln.eps)
+                key_BLD = F.layer_norm(key_BLD, self.k_ln.normalized_shape,
+                                       self._k_ln_w, self._k_ln_b, self.k_ln.eps)
+        else:
+            query_BLD, key_BLD = (
+                self.q_ln(query_BLD).to(query_BLD.dtype),
+                self.k_ln(key_BLD).to(query_BLD.dtype),
+            )
         query_BLD, key_BLD = self._apply_rotary(query_BLD, key_BLD)
 
         reshaper = functools.partial(
