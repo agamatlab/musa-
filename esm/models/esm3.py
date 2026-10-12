@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import contextlib
+import os
+from collections import OrderedDict
 from functools import partial
 from typing import Callable
 
@@ -52,6 +54,12 @@ from esm.utils.structure.affine3d import build_affine3d_from_coordinates
 # [B, 256, L, L, 3] temporary (OOM at L=2048) and needs no device sync.
 SKIP_GEOM_WITHOUT_COORDS = True
 
+# Opt-in fast MUSA inference: ESM3.from_pretrained(..., musa_fast=True) or env ESM_MUSA_FAST=1.
+# BF16 Linear weights + BF16 autocast in logits()/generate(), and logits() replays a cached
+# MUSA graph per input shape (coordinate-free inputs). Default stays the FP32 path.
+MUSA_FAST = os.environ.get("ESM_MUSA_FAST", "0") == "1"
+LOGITS_GRAPH_CACHE_SIZE = 8
+
 
 def _musa_available() -> bool:
     """Return whether this PyTorch build exposes a usable MUSA backend."""
@@ -75,9 +83,12 @@ def resolve_esm3_device(device: torch.device | str | None = None) -> torch.devic
     return torch.device("cpu")
 
 
-def _inference_autocast(device: torch.device):
+def _inference_autocast(device: torch.device, musa_fast: bool = False):
     # Torch-MUSA's BF16 path accumulates enough projection error to diverge in
-    # deep ESM3 stacks. Preserve the checkpoint's FP32 execution on MUSA.
+    # deep ESM3 stacks. Preserve the checkpoint's FP32 execution on MUSA, unless the
+    # model was loaded with musa_fast (validated by tests/accuracy_suite.py).
+    if device.type == "musa" and musa_fast:
+        return torch.autocast(device_type="musa", dtype=torch.bfloat16)
     if device.type == "cuda":
         return torch.autocast(device_type=device.type, dtype=torch.bfloat16)
     return contextlib.nullcontext()
@@ -268,7 +279,10 @@ class ESM3(nn.Module, ESM3InferenceClient):
 
     @classmethod
     def from_pretrained(
-        cls, model_name: str = ESM3_OPEN_SMALL, device: torch.device | None = None
+        cls,
+        model_name: str = ESM3_OPEN_SMALL,
+        device: torch.device | None = None,
+        musa_fast: bool | None = None,
     ) -> ESM3:
         from esm.pretrained import load_local_model
 
@@ -282,7 +296,48 @@ class ESM3(nn.Module, ESM3InferenceClient):
         else:
             model = model.to(torch.float32)
         assert isinstance(model, ESM3)
+        if device.type == "musa" and (MUSA_FAST if musa_fast is None else musa_fast):
+            from esm.utils.bf16_linears import prepare_bf16_linears
+
+            prepare_bf16_linears(model)
+            model._musa_fast = True
         return model
+
+    def _graph_forward(self, **kw) -> ESMOutput:
+        """Forward via a cached MUSA graph for this exact set of input shapes/dtypes.
+
+        Inputs are copied into static buffers; outputs are cloned so a later replay
+        cannot overwrite tensors already returned to the caller.
+        """
+        key = tuple((k, None if v is None else (tuple(v.shape), v.dtype)) for k, v in kw.items())
+        cache = self.__dict__.setdefault("_graph_cache", OrderedDict())
+        entry = cache.get(key)
+        if entry is None:
+            while len(cache) >= LOGITS_GRAPH_CACHE_SIZE:
+                cache.popitem(last=False)
+            static = {k: None if v is None else v.clone() for k, v in kw.items()}
+            side = torch.musa.Stream()
+            side.wait_stream(torch.musa.current_stream())
+            with torch.musa.stream(side):
+                self(**static)  # warm-up: kernel selection, allocator, rotary tables
+            graph = torch.musa.MUSAGraph()
+            with torch.musa.stream(side):
+                graph.capture_begin()
+                try:
+                    out = self(**static)
+                finally:
+                    graph.capture_end()
+            torch.musa.current_stream().wait_stream(side)
+            entry = cache[key] = (graph, static, out)
+        else:
+            cache.move_to_end(key)
+        graph, static, out = entry
+        for k, v in kw.items():
+            if v is not None:
+                static[k].copy_(v)
+        graph.replay()
+        return ESMOutput(**{k: (v.clone() if isinstance(v, torch.Tensor) else v)
+                            for k, v in vars(out).items()})
 
     @property
     def device(self):
@@ -580,11 +635,12 @@ class ESM3(nn.Module, ESM3InferenceClient):
             # 1.0 if all coordinates at specific indices have valid non-nan values.
             per_res_plddt = input.coordinates.isfinite().all(dim=-1).any(dim=-1).float()
 
+        musa_fast = getattr(self, "_musa_fast", False)
         with (
             torch.no_grad(),  # Assume no gradients for now...
-            _inference_autocast(device),
+            _inference_autocast(device, musa_fast),
         ):
-            output = self(
+            kw = dict(
                 sequence_tokens=input.sequence,
                 structure_tokens=input.structure,
                 ss8_tokens=input.secondary_structure,
@@ -593,10 +649,16 @@ class ESM3(nn.Module, ESM3InferenceClient):
                 residue_annotation_tokens=input.residue_annotations,
                 average_plddt=torch.tensor(1.0, device=input.device),
                 per_res_plddt=per_res_plddt,
-                structure_coords=input.coordinates,
-                chain_id=None,
-                sequence_id=None,
             )
+            if musa_fast and device.type == "musa" and input.coordinates is None:
+                output = self._graph_forward(**kw)
+            else:
+                output = self(
+                    **kw,
+                    structure_coords=input.coordinates,
+                    chain_id=None,
+                    sequence_id=None,
+                )
 
         output = ESMOutput(
             **{
