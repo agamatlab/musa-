@@ -521,8 +521,10 @@ def build_affine3d_from_coordinates(
     coords: torch.Tensor,  # (N, CA, C).
 ) -> tuple[Affine3D, torch.Tensor]:
     _MAX_SUPPORTED_DISTANCE = 1e6
+    # Equivalent to isfinite(coords) & (coords < MAX): NaN and +/-inf all compare
+    # False here. torch.isfinite breaks MUSA graph capture (torch_musa 2.9.1).
     coord_mask = torch.all(
-        torch.all(torch.isfinite(coords) & (coords < _MAX_SUPPORTED_DISTANCE), dim=-1),
+        torch.all((coords < _MAX_SUPPORTED_DISTANCE) & (coords > float("-inf")), dim=-1),
         dim=-1,
     )
 
@@ -531,7 +533,9 @@ def build_affine3d_from_coordinates(
         return Affine3D.from_graham_schmidt(C, CA, N)
 
     coords = coords.clone().float()
-    coords[~coord_mask] = 0
+    # masked_fill instead of boolean-index assignment: same result, but no
+    # nonzero() host sync, so the forward can be captured into a MUSA/CUDA graph.
+    coords = coords.masked_fill(~coord_mask[..., None, None], 0)
 
     # NOTE(thayes): If you have already normalized the coordinates, then
     # the black hole affine translations will be zeros and the rotations will be
