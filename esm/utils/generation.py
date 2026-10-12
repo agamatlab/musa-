@@ -127,6 +127,10 @@ def iterative_sampling_raw(
     return raw_proteins
 
 
+# Batches where no prompt has coordinates keep `coordinates=None` (see _stack_protein_tensors).
+KEEP_NONE_COORDINATES = True
+
+
 def _make_masked_inputs(
     track: str, sequence_length: int, tokenizers: TokenizerCollectionProtocol
 ):
@@ -187,6 +191,12 @@ def _stack_protein_tensors(
 
     def _stack_field(fn: str):
         tensors = [getattr(tokens, fn) for tokens in input_tokens]
+
+        # No prompt has coordinates: keep None instead of all-inf mock tensors, so
+        # ESM3.forward can skip the (all-masked, exactly-zero) geometric attention.
+        if fn == "coordinates" and KEEP_NONE_COORDINATES and all(t is None for t in tensors):
+            setattr(o, fn, None)
+            return
 
         # Create all mask mock inputs for any tensors that are None.
         tensors = [
